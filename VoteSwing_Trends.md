@@ -1,0 +1,463 @@
+Swing Votes Analysis
+================
+
+``` r
+# set colors and loess
+
+swing_colors <- c(
+  "Con → Reform" = "#12B6CF", # Reform cyan 
+  "Lab → Greens" = "#02A95B",   # Green
+  "Ref → Con"    = "#0087DC"  # Conservative
+)
+
+LOESS_SPAN <- 0.35 # smoothing parameter for LOESS based on Jackman (2005)
+```
+
+``` r
+clean_condprobs <- function(filepath) {
+
+  raw <- read_csv(filepath, show_col_types = FALSE) %>%
+    rename_with(tolower)
+
+  raw %>%
+    mutate(
+      date = suppressWarnings(case_when(
+        !is.na(mdy(date)) ~ mdy(date),
+        !is.na(dmy(date)) ~ dmy(date),
+        TRUE ~ NA_Date_
+      )),
+      n = as.numeric(str_remove_all(as.character(n), ","))
+    ) %>%
+    filter(!is.na(date)) %>%
+    arrange(date) %>%
+    select(date, pollster, n, con_ref, lab_green, ref_con) %>%
+    pivot_longer(
+      cols      = c(con_ref, lab_green, ref_con),
+      names_to  = "swing",
+      values_to = "pct"
+    ) %>%
+    mutate(
+      swing = recode(swing,
+        con_ref   = "Con → Reform",
+        lab_green = "Lab → Greens",
+        ref_con   = "Ref → Con"
+      )
+    )
+}
+```
+
+``` r
+# subset for repeatability and draw monthly averages
+
+subset_period <- function(df, start, end) {
+  df %>% filter(date >= ymd(start), date <= ymd(end))
+}
+
+monthly_swing <- function(df) {
+
+  df %>%
+    mutate(month = floor_date(date, "month")) %>%
+    group_by(month, swing) %>%
+    summarise(
+      mean_pct = mean(pct, na.rm = TRUE),
+      se       = sd(pct, na.rm = TRUE) / sqrt(n()),
+      n_polls  = n(),
+      .groups  = "drop"
+    ) %>%
+    group_by(swing) %>%
+    mutate(
+      rank_label = case_when(
+        mean_pct == max(mean_pct) ~ "Highest",
+        mean_pct == min(mean_pct) ~ "Lowest",
+        TRUE                      ~ NA_character_
+      )
+    ) %>%
+    ungroup()
+}
+```
+
+``` r
+# fit LOESS smoother to the conditional probability data
+
+smooth_swing <- function(df, span = LOESS_SPAN) {
+
+  date_seq <- seq(min(df$date), max(df$date), by = "day")
+
+  map_dfr(unique(df$swing), function(s) {
+
+    sub <- df %>% filter(swing == s) %>% mutate(t = as.numeric(date))
+
+    if (nrow(sub) < 5) {
+      warning(glue("omit '{s}': fewer than 5 observations."))
+      return(NULL)
+    }
+
+    fit  <- suppressWarnings(
+      loess(pct ~ t, data = sub, span = span, degree = 1, na.action = na.exclude)
+    )
+    pred <- suppressWarnings(
+      predict(fit, newdata = data.frame(t = as.numeric(date_seq)), se = TRUE)
+    )
+
+    tibble(
+      date     = date_seq,
+      swing     = s,
+      estimate = pred$fit,
+      ci_lo    = pred$fit - 1.96 * pred$se.fit,
+      ci_hi    = pred$fit + 1.96 * pred$se.fit
+    )
+  }) %>%
+    filter(!is.na(estimate))
+}
+```
+
+``` r
+# estimate house effects for pollsters 
+
+house_effects <- function(df) {
+  grand_means <- df %>%
+    mutate(month = floor_date(date, "month")) %>%
+    group_by(month, swing) %>%
+    summarise(grand_mean = mean(pct, na.rm = TRUE), .groups = "drop")
+
+  df %>%
+    mutate(month = floor_date(date, "month")) %>%
+    left_join(grand_means, by = c("month", "swing")) %>%
+    mutate(deviation = pct - grand_mean) %>%
+    group_by(pollster, swing) %>%
+    summarise(
+      house_effect = mean(deviation, na.rm = TRUE),
+      n_polls      = n(),
+      .groups      = "drop"
+    ) %>%
+    filter(n_polls >= 3) %>%
+    arrange(swing, desc(abs(house_effect)))
+}
+```
+
+``` r
+# loess plot
+
+plot_trends <- function(raw, smoothed, period_label) {
+
+  latest <- smoothed %>%
+    group_by(swing) %>%
+    filter(date == max(date)) %>%
+    ungroup()
+
+  ggplot() +
+    geom_point(
+      data  = raw,
+      aes(x = date, y = pct, colour = swing),
+      alpha = 0.25, size = 1.8, shape = 16
+    ) +
+    geom_ribbon(
+      data  = smoothed,
+      aes(x = date, ymin = ci_lo, ymax = ci_hi, fill = swing),
+      alpha = 0.15
+    ) +
+    geom_line(
+      data      = smoothed,
+      aes(x = date, y = estimate, colour = swing),
+      linewidth = 1.1
+    ) +
+    geom_text(
+      data  = latest,
+      aes(x = date + days(4), y = estimate, label = swing, colour = swing),
+      hjust = 0, size = 2.9, fontface = "bold"
+    ) +
+    scale_colour_manual(values = swing_colors, guide = "none") +
+    scale_fill_manual(values   = swing_colors, guide = "none") +
+    scale_y_continuous(labels  = label_number(suffix = "%"), limits = c(0, 45)) +
+    scale_x_date(
+      date_breaks = "2 months", date_labels = "%b '%y",
+      expand = expansion(mult = c(0.01, 0.12))
+    ) +
+    labs(
+      title    = glue("Voter Swing Trends — {period_label}"),
+      x = NULL, y = "% swing",
+    )
+}
+```
+
+``` r
+# Monthly averages plot
+
+plot_monthly <- function(monthly, period_label) {
+
+  high_low <- monthly %>%
+    filter(!is.na(rank_label)) %>%
+    mutate(month_label = format(month, "%b '%y"))
+
+  ggplot(monthly, aes(x = month, y = mean_pct, colour = swing)) +
+    geom_line(linewidth = 0.9, alpha = 0.7) +
+    geom_point(size = 1.8, alpha = 0.6) +
+    geom_errorbar(
+      aes(ymin = mean_pct - 1.96 * se, ymax = mean_pct + 1.96 * se),
+      width = 8, linewidth = 0.35, alpha = 0.5
+    ) +
+    geom_point(
+      data  = high_low,
+      size = 4, shape = 21, fill = "white", stroke = 1.5
+    ) +
+    geom_text(
+      data = high_low,
+      aes(y = mean_pct + 1.96 * replace_na(se, 0) + 2.5,
+          label = glue("{rank_label}\n{month_label}")),
+      size = 2.6, fontface = "bold", colour = "#333333", lineheight = 0.9
+    ) +
+    facet_wrap(~ swing, ncol = 1, scales = "free_y") +
+    scale_colour_manual(values = swing_colors, guide = "none") +
+    scale_x_date(date_breaks = "2 months", date_labels = "%b\n'%y") +
+    scale_y_continuous(labels = label_number(suffix = "%")) +
+    labs(
+      title    = glue("Monthly Average Swing — {period_label}"),
+      x = NULL, y = "% swing"
+      )
+}
+```
+
+``` r
+# House Effects Plot
+
+plot_house_effects <- function(he) {
+
+  ggplot(he, aes(x = house_effect,
+                  y = fct_reorder(pollster, house_effect, .fun = mean),
+                  colour = swing)) +
+    geom_vline(xintercept = 0, colour = "#aaa", linewidth = 0.8) +
+    geom_segment(
+      aes(x = 0, xend = house_effect, yend = pollster),
+      linewidth = 0.6, alpha = 0.5
+    ) +
+    geom_point(size = 3.5, alpha = 0.9) +
+    facet_wrap(~ swing, scales = "free_y", ncol = 3) +
+    scale_colour_manual(values = swing_colors, guide = "none") +
+    scale_x_continuous(
+      labels = label_number(suffix = "pp", style_positive = "plus")
+    ) +
+    labs(
+      title    = "Pollster House Effects — Voter Swing Estimates",
+      x = "House effect (percentage points)", y = NULL
+    )
+}
+```
+
+``` r
+# repeatability analysis 
+
+run_swing_analysis <- function(df, start_date, end_date, label) {
+
+  cat("\n", strrep("═", 58), "\n")
+  cat(glue("  WAVE: {label}\n"))
+  cat(strrep("═", 58), "\n")
+
+  sub       <- subset_period(df, start_date, end_date)
+  n_surveys <- n_distinct(paste(sub$date, sub$pollster)) / 3
+
+  cat(glue("  Surveys in window: {round(n_surveys)}\n",
+           "  Date range:        {min(sub$date)} to {max(sub$date)}\n\n"))
+
+  smoothed <- smooth_swing(sub)
+  monthly  <- monthly_swing(sub)
+
+  monthly %>%
+    filter(!is.na(rank_label)) %>%
+    mutate(Month = format(month, "%B %Y"), `Mean %` = round(mean_pct, 1)) %>%
+    select(Swing = swing, Type = rank_label, Month, `Mean %`) %>%
+    arrange(Swing, desc(`Mean %`)) %>%
+    knitr::kable(format = "simple") %>%
+    print()
+
+  list(
+    sub       = sub,
+    smoothed  = smoothed,
+    monthly   = monthly,
+    trend_p   = plot_trends(sub, smoothed, label),
+    monthly_p = plot_monthly(monthly, label)
+  )
+}
+```
+
+``` r
+vote_swing <- clean_condprobs("Conditional_Probabilities_2426.csv")
+
+he_full <- house_effects(vote_swing)
+p_house <- plot_house_effects(he_full)
+
+w1 <- run_swing_analysis(
+  vote_swing,
+  start_date = "2024-08-01",
+  end_date   = "2024-10-31",
+  label      = "Initial Post Event Period (Aug–Oct 2024)"
+)
+```
+
+    ## 
+    ##  ══════════════════════════════════════════════════════════ 
+    ## WAVE: Initial Post Event Period (Aug–Oct 2024)══════════════════════════════════════════════════════════ 
+    ## Surveys in window: 5
+    ## Date range:        2024-08-05 to 2024-10-30
+    ## 
+    ## 
+    ## Swing          Type      Month             Mean %
+    ## -------------  --------  ---------------  -------
+    ## Con → Reform   Highest   October 2024         9.0
+    ## Con → Reform   Lowest    August 2024          8.3
+    ## Lab → Greens   Highest   August 2024          4.7
+    ## Lab → Greens   Lowest    October 2024         3.2
+    ## Ref → Con      Highest   September 2024       7.7
+    ## Ref → Con      Lowest    August 2024          3.7
+
+``` r
+w2 <- run_swing_analysis(
+  vote_swing,
+  start_date = "2024-11-01",
+  end_date   = "2025-02-28",
+  label      = "Low Irregular Political Event Period (Nov 2024 – Feb 2025)"
+)
+```
+
+    ## 
+    ##  ══════════════════════════════════════════════════════════ 
+    ## WAVE: Low Irregular Political Event Period (Nov 2024 – Feb 2025)══════════════════════════════════════════════════════════ 
+    ## Surveys in window: 18
+    ## Date range:        2024-11-01 to 2025-02-28
+    ## 
+    ## 
+    ## Swing          Type      Month            Mean %
+    ## -------------  --------  --------------  -------
+    ## Con → Reform   Highest   February 2025      21.8
+    ## Con → Reform   Lowest    November 2024      10.4
+    ## Lab → Greens   Highest   February 2025       5.4
+    ## Lab → Greens   Lowest    November 2024       4.7
+    ## Ref → Con      Highest   November 2024       7.6
+    ## Ref → Con      Lowest    February 2025       4.1
+
+``` r
+w3 <- run_swing_analysis(
+  vote_swing,
+  start_date = "2025-03-01",
+  end_date   = "2025-12-31",
+  label      = "High Irregular Political Event Period (Mar–Dec 2025)"
+)
+```
+
+    ## 
+    ##  ══════════════════════════════════════════════════════════ 
+    ## WAVE: High Irregular Political Event Period (Mar–Dec 2025)══════════════════════════════════════════════════════════ 
+    ## Surveys in window: 64
+    ## Date range:        2025-03-02 to 2025-12-31
+    ## 
+    ## 
+    ## Swing          Type      Month             Mean %
+    ## -------------  --------  ---------------  -------
+    ## Con → Reform   Highest   September 2025      32.4
+    ## Con → Reform   Lowest    March 2025          19.0
+    ## Lab → Greens   Highest   December 2025       17.9
+    ## Lab → Greens   Lowest    March 2025           6.3
+    ## Ref → Con      Highest   March 2025           5.4
+    ## Ref → Con      Lowest    July 2025            2.8
+
+``` r
+smoothed_full <- smooth_swing(vote_swing)
+monthly_full  <- monthly_swing(vote_swing)
+
+p_full_trend   <- plot_trends(vote_swing, smoothed_full, "Full Period (Aug 2024 – Jan 2026)")
+p_full_monthly <- plot_monthly(monthly_full, "Full Period (Aug 2024 – Jan 2026)")
+
+cat("\n", strrep("═", 58), "\n")
+```
+
+    ## 
+    ##  ══════════════════════════════════════════════════════════
+
+``` r
+cat("  FULL PERIOD — Highest and Lowest Summary\n")
+```
+
+    ##   FULL PERIOD — Highest and Lowest Summary
+
+``` r
+cat(strrep("═", 58), "\n")
+```
+
+    ## ══════════════════════════════════════════════════════════
+
+``` r
+monthly_full %>%
+  filter(!is.na(rank_label)) %>%
+  mutate(Month = format(month, "%B %Y"), `Mean %` = round(mean_pct, 1)) %>%
+  select(Swing = swing, Type = rank_label, Month, `Mean %`) %>%
+  arrange(Swing, desc(`Mean %`)) %>%
+  knitr::kable(format = "simple") %>%
+  print()
+```
+
+    ## 
+    ## 
+    ## Swing          Type      Month             Mean %
+    ## -------------  --------  ---------------  -------
+    ## Con → Reform   Highest   September 2025      32.4
+    ## Con → Reform   Lowest    August 2024          8.3
+    ## Lab → Greens   Highest   December 2025       17.9
+    ## Lab → Greens   Lowest    October 2024         3.2
+    ## Ref → Con      Highest   September 2024       7.7
+    ## Ref → Con      Lowest    July 2025            2.8
+
+``` r
+p_full_trend
+```
+
+<img src="VoteSwing_Trends_files/figure-gfm/full-period-trend-1.png" alt="" width="100%" style="display: block; margin: auto;" />
+
+``` r
+p_full_monthly
+```
+
+<img src="VoteSwing_Trends_files/figure-gfm/full-period-monthly-1.png" alt="" width="100%" style="display: block; margin: auto;" />
+
+``` r
+p_house
+```
+
+<img src="VoteSwing_Trends_files/figure-gfm/full-period-house-effects-1.png" alt="" width="100%" style="display: block; margin: auto;" />
+
+``` r
+w1$trend_p
+```
+
+    ## Warning: Removed 99 rows containing missing values or values outside the scale range
+    ## (`geom_ribbon()`).
+
+<img src="VoteSwing_Trends_files/figure-gfm/wave-1-trend-1.png" alt="" width="100%" style="display: block; margin: auto;" />
+
+``` r
+w1$monthly_p
+```
+
+<img src="VoteSwing_Trends_files/figure-gfm/wave-1-monthly-1.png" alt="" width="100%" style="display: block; margin: auto;" />
+
+``` r
+w2$trend_p
+```
+
+<img src="VoteSwing_Trends_files/figure-gfm/wave-2-trend-1.png" alt="" width="100%" style="display: block; margin: auto;" />
+
+``` r
+w2$monthly_p
+```
+
+<img src="VoteSwing_Trends_files/figure-gfm/wave-2-monthly-1.png" alt="" width="100%" style="display: block; margin: auto;" />
+
+``` r
+w3$trend_p
+```
+
+<img src="VoteSwing_Trends_files/figure-gfm/wave-3-trend-1.png" alt="" width="100%" style="display: block; margin: auto;" />
+
+``` r
+w3$monthly_p
+```
+
+<img src="VoteSwing_Trends_files/figure-gfm/wave-3-monthly-1.png" alt="" width="100%" style="display: block; margin: auto;" />
